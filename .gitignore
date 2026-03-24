@@ -1,0 +1,14 @@
+# Virtual environment
+.venv/
+
+# Session data and old scripts
+data-collection/sessions/
+data-collection/old/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
