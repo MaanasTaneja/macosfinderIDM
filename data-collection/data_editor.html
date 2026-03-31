@@ -100,7 +100,6 @@
       const videoRef    = useRef(null);
       const timelineRef = useRef(null);
       const progressRef = useRef(null);
-      const listRef     = useRef(null);
 
       const [actions,    setActions]    = useState(() => JSON.parse(JSON.stringify(init)));
       const [currentTime,setCurrentTime]= useState(0);
@@ -108,9 +107,7 @@
       const [isPlaying,  setIsPlaying]  = useState(false);
       const [isScrubbing,setIsScrubbing]= useState(false);
       const [zoom,       setZoom]       = useState(1);
-      const [showNone,   setShowNone]   = useState(false);
       const [selectedKey,setSelectedKey]= useState(null);
-      const [filterType, setFilterType] = useState('ALL');
       const [dirty,      setDirty]      = useState(false);
 
       // sorted frame keys
@@ -133,16 +130,11 @@
         return frameKeys[idx];
       }, [currentTime, duration, frameKeys]);
 
-      // filtered action list for sidebar
-      const actionList = useMemo(() => {
-        return frameKeys.flatMap(key =>
-          actions[key].map((action, idx) => ({ key, idx, action }))
-        ).filter(({ action }) => {
-          if (!showNone && action.action === 'NONE') return false;
-          if (filterType !== 'ALL' && action.action !== filterType) return false;
-          return true;
-        });
-      }, [actions, frameKeys, showNone, filterType]);
+      // ordered non-NONE frame keys for jump navigation
+      const actionFrameIdxs = useMemo(
+        () => frameKeys.reduce((acc, k, i) => { if (actions[k].some(a => a.action !== 'NONE')) acc.push(i); return acc; }, []),
+        [actions, frameKeys]
+      );
 
       // raf for playhead tracking
       useEffect(() => {
@@ -153,12 +145,6 @@
         return () => cancelAnimationFrame(raf);
       }, [isPlaying]);
 
-      // auto-scroll sidebar to current action
-      useEffect(() => {
-        if (!listRef.current || !currentFrameKey || isScrubbing) return;
-        const el = listRef.current.querySelector(`[data-key="${CSS.escape(currentFrameKey)}"]`);
-        if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      }, [currentFrameKey, isScrubbing]);
 
       // keep playhead visible in timeline
       useEffect(() => {
@@ -410,132 +396,144 @@
             </div>
           </div>
 
-          {/* ── RIGHT: action list ── */}
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          {/* ── RIGHT: frame inspector ── */}
+          {(() => {
+            const curIdx   = currentFrameKey ? frameKeys.indexOf(currentFrameKey) : 0;
+            const curActions = currentFrameKey ? actions[currentFrameKey] : [];
+            const hasAction  = curActions.some(a => a.action !== 'NONE');
 
-            {/* header */}
-            <div style={{ padding: '9px 12px', borderBottom: '1px solid #e7e5e4', background: '#f5f5f4', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
-              <span style={{ fontSize: 13, fontWeight: 600 }}>Actions</span>
-              <span style={{ fontSize: 11, color: '#78716c' }}>{actionList.length}</span>
+            // jump to prev / next non-NONE frame
+            const jumpPrev = () => {
+              const i = actionFrameIdxs.filter(i => i < curIdx).pop();
+              if (i != null) { const k = frameKeys[i]; seekTo(frameToTime(k)); setSelectedKey(k); }
+            };
+            const jumpNext = () => {
+              const i = actionFrameIdxs.find(i => i > curIdx);
+              if (i != null) { const k = frameKeys[i]; seekTo(frameToTime(k)); setSelectedKey(k); }
+            };
 
-              {/* filter by type */}
-              <select
-                value={filterType}
-                onChange={e => setFilterType(e.target.value)}
-                style={{ fontSize: 11, border: '1px solid #e7e5e4', borderRadius: 4, padding: '3px 6px', background: 'white', color: '#1c1917', marginLeft: 4 }}
-              >
-                <option value="ALL">All types</option>
-                {ACTION_TYPES.filter(t => t !== 'NONE').map(t => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
+            // step one frame
+            const stepFrame = (delta) => {
+              const ni = Math.max(0, Math.min(frameKeys.length - 1, curIdx + delta));
+              const k  = frameKeys[ni];
+              seekTo(frameToTime(k));
+            };
 
-              <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#78716c', cursor: 'pointer', marginLeft: 'auto' }}>
-                <input type="checkbox" checked={showNone} onChange={e => setShowNone(e.target.checked)} />
-                show NONE
-              </label>
-            </div>
+            // context strip: 9 frames centered on current
+            const STRIP = 4;
+            const stripIdxs = Array.from({ length: STRIP * 2 + 1 }, (_, i) => curIdx - STRIP + i)
+              .filter(i => i >= 0 && i < frameKeys.length);
 
-            {/* legend */}
-            <div style={{ padding: '6px 12px', borderBottom: '1px solid #e7e5e4', display: 'flex', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
-              {ACTION_TYPES.filter(t => t !== 'NONE').map(t => (
-                <span key={t} style={{ fontSize: 9, color: ACTION_COLORS[t], display: 'flex', alignItems: 'center', gap: 3 }}>
-                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: ACTION_COLORS[t], display: 'inline-block' }} />
-                  {t.replace('_',' ')}
-                </span>
-              ))}
-            </div>
+            return (
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
 
-            {/* list */}
-            <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: 10, display: 'flex', flexDirection: 'column', gap: 5 }}>
-              {actionList.map(({ key, idx, action }) => {
-                const isCurrent  = key === currentFrameKey;
-                const isSelected = key === selectedKey;
-                const color      = ACTION_COLORS[action.action] || '#d6d3d1';
-                const frameIdx   = frameKeys.indexOf(key);
-                const t          = frameToTime(key);
+                {/* ── nav bar ── */}
+                <div style={{ padding: '8px 12px', borderBottom: '1px solid #e7e5e4', background: '#f5f5f4', display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                  <button onClick={jumpPrev} title="Jump to prev action" style={{ ...btnStyle, padding: '4px 8px' }}>◀◀ prev</button>
+                  <button onClick={() => stepFrame(-1)} style={{ ...btnStyle, padding: '4px 7px' }}>-1f</button>
 
-                return (
-                  <div
-                    key={`${key}-${idx}`}
-                    data-key={key}
-                    onClick={() => seekToFrame(key)}
-                    style={{
-                      padding: '8px 10px',
-                      borderRadius: 7,
-                      border: `1px solid ${isCurrent ? color + '80' : isSelected ? '#c4b5a5' : '#e7e5e4'}`,
-                      background: isCurrent ? color + '10' : 'white',
-                      cursor: 'pointer',
-                      transition: 'border-color 0.1s, background 0.1s',
-                    }}
-                  >
-                    {/* row 1: dot + frame # + type selector */}
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
-                      <span style={{ width: 9, height: 9, borderRadius: '50%', background: color, flexShrink: 0 }} />
-                      <span style={{ fontSize: 10, color: '#a8a29e', fontFamily: 'monospace', flexShrink: 0 }}>
-                        f{String(frameIdx).padStart(4,' ')} &nbsp;{fmt(t)}
-                      </span>
-                      <select
-                        value={action.action}
-                        onMouseDown={e => e.stopPropagation()}
-                        onClick={e => e.stopPropagation()}
-                        onChange={e => { e.stopPropagation(); changeActionType(key, idx, e.target.value); }}
-                        style={{ fontSize: 10, fontWeight: 600, border: '1px solid #e7e5e4', borderRadius: 4, padding: '2px 4px', background: 'white', cursor: 'pointer', color: color, width: 'auto' }}
-                      >
-                        {ACTION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
-                      </select>
-                    </div>
-
-                    {/* row 2: metadata */}
-                    {action.action !== 'NONE' && (
-                      <div style={{ fontSize: 10, color: '#78716c', paddingLeft: 15, fontFamily: 'monospace', marginBottom: 5 }}>
-                        {action.x  != null && <span>({action.x}, {action.y}) &nbsp;</span>}
-                        {action.key != null && <span>key: "{action.key}" &nbsp;</span>}
-                        {action.dx  != null && <span>scroll Δ({action.dx},{action.dy})</span>}
-                      </div>
-                    )}
-
-                    {/* row 3: nudge / move / delete */}
-                    <div style={{ display: 'flex', gap: 4, paddingLeft: 15 }} onClick={e => e.stopPropagation()}>
-                      <button onClick={() => nudgeAction(key, idx, -1)} title="1 frame earlier"
-                        style={btnStyle}>-1f</button>
-                      <button onClick={() => nudgeAction(key, idx, +1)} title="1 frame later"
-                        style={btnStyle}>+1f</button>
-                      <button onClick={() => nudgeAction(key, idx, -5)} title="5 frames earlier"
-                        style={btnStyle}>-5f</button>
-                      <button onClick={() => nudgeAction(key, idx, +5)} title="5 frames later"
-                        style={btnStyle}>+5f</button>
-                      <button
-                        onClick={() => moveToCurrentFrame(key, idx)}
-                        title={`Move to current frame (f${currentFrameKey ? frameKeys.indexOf(currentFrameKey) : '?'})`}
-                        style={{ ...btnStyle, background: '#fef3c7', color: '#92400e', borderColor: '#fde68a' }}
-                      >→ here</button>
-                      <button onClick={() => deleteAction(key, idx)} title="Delete action"
-                        style={{ ...btnStyle, background: '#fff1f2', color: '#e11d48', borderColor: '#fecdd3', marginLeft: 'auto' }}>✕</button>
-                    </div>
+                  <div style={{ flex: 1, textAlign: 'center' }}>
+                    <code style={{ fontSize: 12, fontWeight: 700, color: '#1c1917' }}>f {curIdx}</code>
+                    <span style={{ fontSize: 10, color: '#a8a29e', marginLeft: 6 }}>/ {frameKeys.length - 1}</span>
+                    <span style={{ fontSize: 10, color: '#a8a29e', marginLeft: 6 }}>{fmt(currentTime)}</span>
                   </div>
-                );
-              })}
 
-              {actionList.length === 0 && (
-                <div style={{ textAlign: 'center', color: '#a8a29e', fontSize: 12, padding: 48 }}>
-                  No actions match the current filter
+                  <button onClick={() => stepFrame(+1)} style={{ ...btnStyle, padding: '4px 7px' }}>+1f</button>
+                  <button onClick={jumpNext} title="Jump to next action" style={{ ...btnStyle, padding: '4px 8px' }}>next ▶▶</button>
                 </div>
-              )}
-            </div>
 
-            {/* footer status */}
-            <div style={{ padding: '6px 12px', borderTop: '1px solid #e7e5e4', background: '#f5f5f4', display: 'flex', gap: 12, flexShrink: 0 }}>
-              {ACTION_TYPES.filter(t=>t!=='NONE').map(t => {
-                const count = Object.values(actions).flat().filter(a=>a.action===t).length;
-                return count > 0 ? (
-                  <span key={t} style={{ fontSize: 10, color: ACTION_COLORS[t] }}>
-                    {t.replace('LEFT_','L').replace('RIGHT_','R').replace('_','')} ×{count}
-                  </span>
-                ) : null;
-              })}
-            </div>
-          </div>
+                {/* ── context strip ── */}
+                <div style={{ padding: '8px 10px', borderBottom: '1px solid #e7e5e4', background: '#fafaf9', display: 'flex', gap: 4, alignItems: 'stretch', flexShrink: 0 }}>
+                  {stripIdxs.map(fi => {
+                    const k          = frameKeys[fi];
+                    const isCur      = fi === curIdx;
+                    const frameActs  = actions[k] || [];
+                    const nonNone    = frameActs.filter(a => a.action !== 'NONE');
+                    return (
+                      <div
+                        key={fi}
+                        onClick={() => { seekTo(frameToTime(k)); setSelectedKey(k); }}
+                        style={{
+                          flex: 1, minWidth: 0, padding: '5px 4px',
+                          borderRadius: 5, cursor: 'pointer', textAlign: 'center',
+                          border: isCur ? '2px solid #1c1917' : '1px solid #e7e5e4',
+                          background: isCur ? '#1c1917' : 'white',
+                        }}
+                      >
+                        <div style={{ fontSize: 9, color: isCur ? '#fbbf24' : '#a8a29e', fontFamily: 'monospace', marginBottom: 3 }}>f{fi}</div>
+                        {nonNone.length > 0
+                          ? nonNone.map((a, i) => (
+                              <div key={i} style={{ width: 8, height: 8, borderRadius: '50%', background: ACTION_COLORS[a.action], margin: '0 auto 2px' }} />
+                            ))
+                          : <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#e7e5e4', margin: '0 auto' }} />
+                        }
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* ── current frame actions ── */}
+                <div style={{ flex: 1, overflowY: 'auto', padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+
+                  {!hasAction && (
+                    <div style={{ textAlign: 'center', color: '#a8a29e', fontSize: 12, padding: '32px 0' }}>
+                      No action on this frame
+                    </div>
+                  )}
+
+                  {curActions.filter(a => a.action !== 'NONE').map((action, idx) => {
+                    const color = ACTION_COLORS[action.action] || '#d6d3d1';
+                    // find real idx in full array
+                    const realIdx = actions[currentFrameKey].indexOf(action);
+                    return (
+                      <div key={idx} style={{ border: `2px solid ${color}30`, borderRadius: 9, background: color + '08', padding: 12 }}>
+                        {/* action type */}
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                          <span style={{ width: 11, height: 11, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                          <select
+                            value={action.action}
+                            onChange={e => changeActionType(currentFrameKey, realIdx, e.target.value)}
+                            style={{ fontSize: 12, fontWeight: 700, border: '1px solid #e7e5e4', borderRadius: 5, padding: '3px 6px', background: 'white', cursor: 'pointer', color: color }}
+                          >
+                            {ACTION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                          </select>
+                          <button onClick={() => deleteAction(currentFrameKey, realIdx)}
+                            style={{ marginLeft: 'auto', ...btnStyle, background: '#fff1f2', color: '#e11d48', borderColor: '#fecdd3', padding: '3px 8px' }}>✕ delete</button>
+                        </div>
+
+                        {/* metadata */}
+                        <div style={{ fontSize: 11, color: '#78716c', fontFamily: 'monospace', marginBottom: 10, paddingLeft: 2 }}>
+                          {action.x  != null && <span>pos ({action.x}, {action.y})&nbsp;&nbsp;</span>}
+                          {action.key != null && <span>key "{action.key}"&nbsp;&nbsp;</span>}
+                          {action.dx  != null && <span>scroll Δ({action.dx}, {action.dy})</span>}
+                        </div>
+
+                        {/* shift buttons */}
+                        <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                          <span style={{ fontSize: 10, color: '#a8a29e', alignSelf: 'center', marginRight: 2 }}>shift:</span>
+                          {[-5,-3,-1,1,3,5].map(d => (
+                            <button key={d} onClick={() => nudgeAction(currentFrameKey, realIdx, d)}
+                              style={{ ...btnStyle, padding: '3px 8px', fontWeight: d < 0 ? 400 : 600, color: d < 0 ? '#57534e' : '#1d4ed8', borderColor: d < 0 ? '#e7e5e4' : '#bfdbfe', background: d < 0 ? 'white' : '#eff6ff' }}>
+                              {d > 0 ? '+' : ''}{d}f
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* ── footer stats ── */}
+                <div style={{ padding: '6px 12px', borderTop: '1px solid #e7e5e4', background: '#f5f5f4', display: 'flex', gap: 10, flexShrink: 0, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 10, color: '#a8a29e' }}>{actionFrameIdxs.length} labeled frames</span>
+                  {ACTION_TYPES.filter(t => t !== 'NONE').map(t => {
+                    const count = Object.values(actions).flat().filter(a => a.action === t).length;
+                    return count > 0 ? <span key={t} style={{ fontSize: 10, color: ACTION_COLORS[t] }}>{t.split('_')[0].toLowerCase()} ×{count}</span> : null;
+                  })}
+                </div>
+              </div>
+            );
+          })()}
         </div>
       );
     }
