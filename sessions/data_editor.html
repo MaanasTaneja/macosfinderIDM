@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Session Action Editor</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #fafaf9; color: #1c1917; }
+    #root { min-height: 100vh; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d6d3d1; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect, useMemo, useCallback } = React;
+
+    const ACTION_TYPES = ['NONE','LEFT_CLICK','RIGHT_CLICK','DOUBLE_CLICK','DRAG_START','DRAG_END','SCROLL','KEY_PRESS'];
+
+    const ACTION_COLORS = {
+      NONE:         '#d6d3d1',
+      LEFT_CLICK:   '#3b82f6',
+      RIGHT_CLICK:  '#8b5cf6',
+      DOUBLE_CLICK: '#06b6d4',
+      DRAG_START:   '#f59e0b',
+      DRAG_END:     '#f97316',
+      SCROLL:       '#10b981',
+      KEY_PRESS:    '#ec4899',
+    };
+
+    // ─── Upload Screen ────────────────────────────────────────────────────────
+    function UploadScreen({ data, onLoad }) {
+      const handleFile = async (file, type) => {
+        if (type === 'json') {
+          const text = await file.text();
+          onLoad(prev => ({ ...prev, actions: JSON.parse(text), jsonName: file.name }));
+        } else {
+          onLoad(prev => ({ ...prev, videoUrl: URL.createObjectURL(file), videoName: file.name }));
+        }
+      };
+
+      const handleDrop = (e) => {
+        e.preventDefault();
+        for (const file of e.dataTransfer.files) {
+          if (file.name.endsWith('.json'))       handleFile(file, 'json');
+          else if (file.type.startsWith('video/')) handleFile(file, 'video');
+        }
+      };
+
+      const hasVideo = !!data.videoUrl;
+      const hasJson  = !!data.actions;
+      const nonNone  = hasJson ? Object.values(data.actions).flat().filter(a => a.action !== 'NONE').length : 0;
+
+      return (
+        <div
+          onDragOver={e => e.preventDefault()}
+          onDrop={handleDrop}
+          style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: 40 }}
+        >
+          <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 6 }}>Session Action Editor</h1>
+          <p style={{ color: '#78716c', fontSize: 13, marginBottom: 32 }}>
+            Load a session <code>.mp4</code> + <code>.json</code> to review and fix action labels
+          </p>
+
+          <div style={{ display: 'flex', gap: 12, marginBottom: 24 }}>
+            {[
+              { label: 'Video', type: 'video', accept: 'video/*', done: hasVideo, sub: hasVideo ? data.videoName : 'Click to upload' },
+              { label: 'JSON',  type: 'json',  accept: '.json',   done: hasJson,  sub: hasJson  ? `${nonNone} labeled actions` : 'Click to upload' },
+            ].map(({ label, type, accept, done, sub }) => (
+              <label key={type} style={{ padding: '18px 28px', border: done ? '1px solid #a8a29e' : '1px dashed #d6d3d1', borderRadius: 10, cursor: 'pointer', background: 'white', minWidth: 170, textAlign: 'center' }}>
+                <input type="file" accept={accept} hidden onChange={e => e.target.files[0] && handleFile(e.target.files[0], type)} />
+                <div style={{ fontSize: 13, fontWeight: 500, color: done ? '#16a34a' : '#1c1917' }}>{done ? `✓ ${label}` : label}</div>
+                <div style={{ fontSize: 11, color: '#78716c', marginTop: 4, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{sub}</div>
+              </label>
+            ))}
+          </div>
+
+          {hasVideo && hasJson && (
+            <button
+              onClick={() => onLoad(prev => ({ ...prev, ready: true }))}
+              style={{ padding: '10px 28px', background: '#1c1917', color: 'white', border: 'none', borderRadius: 7, cursor: 'pointer', fontSize: 13, fontWeight: 500 }}
+            >
+              Open Editor →
+            </button>
+          )}
+
+          <p style={{ fontSize: 11, color: '#a8a29e', marginTop: 16 }}>or drag &amp; drop both files anywhere</p>
+        </div>
+      );
+    }
+
+    // ─── Main Editor ──────────────────────────────────────────────────────────
+    function Editor({ videoUrl, videoName, actions: init, jsonName, onReset }) {
+      const videoRef    = useRef(null);
+      const timelineRef = useRef(null);
+      const progressRef = useRef(null);
+      const listRef     = useRef(null);
+
+      const [actions,    setActions]    = useState(() => JSON.parse(JSON.stringify(init)));
+      const [currentTime,setCurrentTime]= useState(0);
+      const [duration,   setDuration]   = useState(0);
+      const [isPlaying,  setIsPlaying]  = useState(false);
+      const [isScrubbing,setIsScrubbing]= useState(false);
+      const [zoom,       setZoom]       = useState(1);
+      const [showNone,   setShowNone]   = useState(false);
+      const [selectedKey,setSelectedKey]= useState(null);
+      const [filterType, setFilterType] = useState('ALL');
+      const [dirty,      setDirty]      = useState(false);
+
+      // sorted frame keys
+      const frameKeys = useMemo(() => Object.keys(actions).sort(), [actions]);
+
+      // fps derived from frame count / duration
+      const fps = useMemo(() => duration > 0 && frameKeys.length > 0 ? frameKeys.length / duration : null, [duration, frameKeys.length]);
+
+      // frame key → video timestamp
+      const frameToTime = useCallback((key) => {
+        if (!fps || !duration) return 0;
+        const idx = frameKeys.indexOf(key);
+        return (idx / frameKeys.length) * duration;
+      }, [fps, duration, frameKeys]);
+
+      // current frame key under playhead
+      const currentFrameKey = useMemo(() => {
+        if (!duration || !frameKeys.length) return null;
+        const idx = Math.min(Math.floor((currentTime / duration) * frameKeys.length), frameKeys.length - 1);
+        return frameKeys[idx];
+      }, [currentTime, duration, frameKeys]);
+
+      // filtered action list for sidebar
+      const actionList = useMemo(() => {
+        return frameKeys.flatMap(key =>
+          actions[key].map((action, idx) => ({ key, idx, action }))
+        ).filter(({ action }) => {
+          if (!showNone && action.action === 'NONE') return false;
+          if (filterType !== 'ALL' && action.action !== filterType) return false;
+          return true;
+        });
+      }, [actions, frameKeys, showNone, filterType]);
+
+      // raf for playhead tracking
+      useEffect(() => {
+        if (!isPlaying) return;
+        let raf;
+        const tick = () => { if (videoRef.current) setCurrentTime(videoRef.current.currentTime); raf = requestAnimationFrame(tick); };
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+      }, [isPlaying]);
+
+      // auto-scroll sidebar to current action
+      useEffect(() => {
+        if (!listRef.current || !currentFrameKey || isScrubbing) return;
+        const el = listRef.current.querySelector(`[data-key="${CSS.escape(currentFrameKey)}"]`);
+        if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }, [currentFrameKey, isScrubbing]);
+
+      // keep playhead visible in timeline
+      useEffect(() => {
+        if (!progressRef.current || !timelineRef.current || !duration || isScrubbing) return;
+        const c = progressRef.current;
+        const x = (currentTime / duration) * timelineRef.current.offsetWidth;
+        if (x < c.scrollLeft + 40 || x > c.scrollLeft + c.clientWidth - 40) {
+          c.scrollLeft = x - c.clientWidth / 2;
+        }
+      }, [currentTime, duration, zoom, isScrubbing]);
+
+      // zoom on ctrl+scroll
+      useEffect(() => {
+        const el = progressRef.current;
+        if (!el) return;
+        const handler = (e) => {
+          if (e.ctrlKey || e.metaKey) {
+            e.preventDefault();
+            setZoom(z => Math.max(1, Math.min(20, z * (e.deltaY > 0 ? 0.92 : 1.09))));
+          }
+        };
+        el.addEventListener('wheel', handler, { passive: false });
+        return () => el.removeEventListener('wheel', handler);
+      }, []);
+
+      // scrubbing mouse handling
+      const scrubTo = useCallback((e) => {
+        if (!timelineRef.current || !progressRef.current || !duration) return;
+        const rect = progressRef.current.getBoundingClientRect();
+        const x = e.clientX - rect.left + progressRef.current.scrollLeft;
+        const t = (x / timelineRef.current.offsetWidth) * duration;
+        const clamped = Math.max(0, Math.min(duration, t));
+        if (videoRef.current) { videoRef.current.currentTime = clamped; setCurrentTime(clamped); }
+      }, [duration]);
+
+      useEffect(() => {
+        if (!isScrubbing) return;
+        document.body.style.userSelect = 'none';
+        const move = (e) => scrubTo(e);
+        const up   = () => { setIsScrubbing(false); document.body.style.userSelect = ''; };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+        return () => { document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); document.body.style.userSelect = ''; };
+      }, [isScrubbing, scrubTo]);
+
+      // keyboard shortcuts
+      useEffect(() => {
+        const handler = (e) => {
+          if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
+          const step = e.shiftKey ? 1.0 : (fps ? 1/fps : 0.1);
+          if (e.key === ' ') { e.preventDefault(); videoRef.current && (isPlaying ? videoRef.current.pause() : videoRef.current.play()); }
+          if (e.key === 'ArrowLeft')  { e.preventDefault(); const v = videoRef.current; if (v) { v.currentTime = Math.max(0, v.currentTime - step); setCurrentTime(v.currentTime); } }
+          if (e.key === 'ArrowRight') { e.preventDefault(); const v = videoRef.current; if (v) { v.currentTime = Math.min(duration, v.currentTime + step); setCurrentTime(v.currentTime); } }
+        };
+        window.addEventListener('keydown', handler);
+        return () => window.removeEventListener('keydown', handler);
+      }, [isPlaying, fps, duration]);
+
+      const seekTo = (t) => {
+        const v = videoRef.current;
+        if (!v) return;
+        v.currentTime = t;
+        setCurrentTime(t);
+      };
+
+      const seekToFrame = (key) => {
+        seekTo(frameToTime(key));
+        setSelectedKey(key);
+      };
+
+      // ── mutations ─────────────────────────────────────────────────────────
+      const mutate = (fn) => { setActions(prev => { const next = fn(JSON.parse(JSON.stringify(prev))); return next; }); setDirty(true); };
+
+      const changeActionType = (key, idx, newType) => mutate(prev => {
+        prev[key][idx].action = newType;
+        return prev;
+      });
+
+      const removeFromFrame = (draft, key, idx) => {
+        draft[key].splice(idx, 1);
+        if (draft[key].length === 0) draft[key] = [{ action: 'NONE' }];
+      };
+
+      const addToFrame = (draft, key, action) => {
+        draft[key] = draft[key].filter(a => a.action !== 'NONE');
+        draft[key].push(action);
+        if (draft[key].length === 0) draft[key] = [{ action: 'NONE' }];
+      };
+
+      const nudgeAction = (fromKey, idx, delta) => {
+        const fromIdx = frameKeys.indexOf(fromKey);
+        const toIdx   = Math.max(0, Math.min(frameKeys.length - 1, fromIdx + delta));
+        if (toIdx === fromIdx) return;
+        const toKey = frameKeys[toIdx];
+        mutate(prev => {
+          const action = { ...prev[fromKey][idx] };
+          removeFromFrame(prev, fromKey, idx);
+          addToFrame(prev, toKey, action);
+          return prev;
+        });
+      };
+
+      const moveToCurrentFrame = (fromKey, idx) => {
+        if (!currentFrameKey || fromKey === currentFrameKey) return;
+        mutate(prev => {
+          const action = { ...prev[fromKey][idx] };
+          removeFromFrame(prev, fromKey, idx);
+          addToFrame(prev, currentFrameKey, action);
+          return prev;
+        });
+      };
+
+      const deleteAction = (key, idx) => mutate(prev => { removeFromFrame(prev, key, idx); return prev; });
+
+      // ── export ────────────────────────────────────────────────────────────
+      const exportJson = () => {
+        const blob = new Blob([JSON.stringify(actions, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = jsonName.replace('.json', '_edited.json');
+        a.click();
+        setDirty(false);
+      };
+
+      // ── helpers ───────────────────────────────────────────────────────────
+      const fmt = (s) => {
+        const m  = Math.floor(s / 60);
+        const sc = Math.floor(s % 60);
+        const ms = Math.floor((s % 1) * 100);
+        return `${String(m).padStart(2,'0')}:${String(sc).padStart(2,'0')}.${String(ms).padStart(2,'0')}`;
+      };
+
+      const nonNoneFrameKeys = useMemo(
+        () => frameKeys.filter(k => actions[k].some(a => a.action !== 'NONE')),
+        [actions, frameKeys]
+      );
+
+      // ─────────────────────────────────────────────────────────────────────
+      return (
+        <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+
+          {/* ── LEFT: video + timeline + controls ── */}
+          <div style={{ width: '56%', display: 'flex', flexDirection: 'column', borderRight: '1px solid #e7e5e4' }}>
+
+            {/* video */}
+            <div style={{ flex: 1, background: '#0c0a09', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 12, overflow: 'hidden' }}>
+              <video
+                ref={videoRef}
+                src={videoUrl}
+                onClick={() => videoRef.current && (isPlaying ? videoRef.current.pause() : videoRef.current.play())}
+                onPlay={() => setIsPlaying(true)}
+                onPause={() => setIsPlaying(false)}
+                onLoadedMetadata={e => setDuration(e.target.duration)}
+                style={{ maxWidth: '100%', maxHeight: '100%', borderRadius: 6, cursor: 'pointer' }}
+              />
+            </div>
+
+            {/* timeline */}
+            <div
+              ref={progressRef}
+              onMouseDown={e => { setIsScrubbing(true); scrubTo(e); }}
+              style={{ height: 46, background: '#1c1917', cursor: 'crosshair', position: 'relative', overflowX: 'auto', overflowY: 'hidden', userSelect: 'none', flexShrink: 0 }}
+            >
+              <div ref={timelineRef} style={{ position: 'relative', height: '100%', width: `${100 * zoom}%`, minWidth: '100%' }}>
+                {/* second ticks */}
+                {duration > 0 && Array.from({ length: Math.ceil(duration) + 1 }, (_, i) => (
+                  <div key={i} style={{ position: 'absolute', left: `${(i / duration) * 100}%`, top: 0, height: i % 5 === 0 ? 14 : 6, width: 1, background: 'rgba(255,255,255,0.12)' }}>
+                    {i % 5 === 0 && <span style={{ position: 'absolute', top: 16, left: -12, width: 24, textAlign: 'center', fontSize: 8, color: 'rgba(255,255,255,0.3)' }}>{i}s</span>}
+                  </div>
+                ))}
+
+                {/* action markers */}
+                {nonNoneFrameKeys.map(key => {
+                  const t    = frameToTime(key);
+                  const pct  = duration ? (t / duration) * 100 : 0;
+                  const type = actions[key].find(a => a.action !== 'NONE')?.action || 'NONE';
+                  return (
+                    <div
+                      key={key}
+                      onClick={e => { e.stopPropagation(); seekToFrame(key); }}
+                      title={type}
+                      style={{
+                        position: 'absolute', left: `${pct}%`, top: 4, bottom: 4,
+                        width: selectedKey === key ? 4 : 3,
+                        background: ACTION_COLORS[type] || '#fff',
+                        borderRadius: 1, zIndex: 3, cursor: 'pointer',
+                        opacity: selectedKey === key ? 1 : 0.7,
+                        boxShadow: selectedKey === key ? `0 0 4px ${ACTION_COLORS[type]}` : 'none',
+                      }}
+                    />
+                  );
+                })}
+
+                {/* playhead */}
+                <div style={{ position: 'absolute', left: duration ? `${(currentTime / duration) * 100}%` : 0, top: 0, bottom: 0, width: 2, background: '#ef4444', zIndex: 10, transform: 'translateX(-1px)', pointerEvents: 'none' }}>
+                  <div style={{ position: 'absolute', top: -1, left: -4, width: 0, height: 0, borderLeft: '5px solid transparent', borderRight: '5px solid transparent', borderTop: '6px solid #ef4444' }} />
+                </div>
+              </div>
+            </div>
+
+            {/* controls bar */}
+            <div style={{ padding: '9px 12px', background: '#f5f5f4', borderTop: '1px solid #e7e5e4', display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0 }}>
+              {/* play/pause */}
+              <button onClick={() => videoRef.current && (isPlaying ? videoRef.current.pause() : videoRef.current.play())}
+                style={{ width: 32, height: 32, border: 'none', borderRadius: 6, background: '#1c1917', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                {isPlaying
+                  ? <svg width="11" height="11" viewBox="0 0 24 24" fill="white"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+                  : <svg width="11" height="11" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>}
+              </button>
+              {/* step buttons */}
+              <button onClick={() => { const v=videoRef.current; if(v){v.currentTime=Math.max(0,v.currentTime-(fps?1/fps:0.1));setCurrentTime(v.currentTime);}}}
+                style={{ width: 26, height: 26, border: 'none', borderRadius: 4, background: '#e7e5e4', cursor: 'pointer', fontSize: 11, color: '#57534e' }}>◀</button>
+              <button onClick={() => { const v=videoRef.current; if(v){v.currentTime=Math.min(duration,v.currentTime+(fps?1/fps:0.1));setCurrentTime(v.currentTime);}}}
+                style={{ width: 26, height: 26, border: 'none', borderRadius: 4, background: '#e7e5e4', cursor: 'pointer', fontSize: 11, color: '#57534e' }}>▶</button>
+
+              {/* timecode */}
+              <code style={{ padding: '4px 8px', background: '#1c1917', color: '#86efac', borderRadius: 4, fontSize: 11, flexShrink: 0 }}>
+                {fmt(currentTime)} / {fmt(duration)}
+              </code>
+
+              {/* current frame badge */}
+              {currentFrameKey && (
+                <code style={{ padding: '4px 7px', background: '#292524', color: '#fbbf24', borderRadius: 4, fontSize: 10, flexShrink: 0 }}>
+                  f{frameKeys.indexOf(currentFrameKey)} {fps ? `@ ${fps.toFixed(1)}fps` : ''}
+                </code>
+              )}
+
+              {/* current frame action badge */}
+              {currentFrameKey && actions[currentFrameKey]?.some(a => a.action !== 'NONE') && (
+                <span style={{ padding: '3px 7px', borderRadius: 4, fontSize: 10, fontWeight: 500, background: ACTION_COLORS[actions[currentFrameKey].find(a=>a.action!=='NONE')?.action] + '30', color: ACTION_COLORS[actions[currentFrameKey].find(a=>a.action!=='NONE')?.action], flexShrink: 0 }}>
+                  {actions[currentFrameKey].find(a=>a.action!=='NONE')?.action}
+                </span>
+              )}
+
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }}>
+                {/* zoom */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 1, background: '#e7e5e4', borderRadius: 4, padding: 2 }}>
+                  <button onClick={() => setZoom(z=>Math.max(1,z/1.5))} style={{ width: 22, height: 22, border: 'none', borderRadius: 3, background: 'transparent', cursor: 'pointer', color: '#57534e', fontSize: 13 }}>−</button>
+                  <span style={{ fontSize: 10, color: '#78716c', minWidth: 28, textAlign: 'center' }}>{Math.round(zoom*100)}%</span>
+                  <button onClick={() => setZoom(z=>Math.min(20,z*1.5))} style={{ width: 22, height: 22, border: 'none', borderRadius: 3, background: 'transparent', cursor: 'pointer', color: '#57534e', fontSize: 13 }}>+</button>
+                </div>
+                {/* export */}
+                <button onClick={exportJson}
+                  style={{ padding: '5px 11px', border: 'none', borderRadius: 5, background: dirty ? '#16a34a' : '#a8a29e', color: 'white', cursor: 'pointer', fontSize: 11, fontWeight: 600 }}>
+                  {dirty ? '● Export JSON' : 'Export JSON'}
+                </button>
+                <button onClick={onReset} style={{ padding: '5px 9px', border: '1px solid #d6d3d1', borderRadius: 5, background: 'white', cursor: 'pointer', fontSize: 11, color: '#57534e' }}>↩</button>
+              </div>
+            </div>
+          </div>
+
+          {/* ── RIGHT: action list ── */}
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+
+            {/* header */}
+            <div style={{ padding: '9px 12px', borderBottom: '1px solid #e7e5e4', background: '#f5f5f4', display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>Actions</span>
+              <span style={{ fontSize: 11, color: '#78716c' }}>{actionList.length}</span>
+
+              {/* filter by type */}
+              <select
+                value={filterType}
+                onChange={e => setFilterType(e.target.value)}
+                style={{ fontSize: 11, border: '1px solid #e7e5e4', borderRadius: 4, padding: '3px 6px', background: 'white', color: '#1c1917', marginLeft: 4 }}
+              >
+                <option value="ALL">All types</option>
+                {ACTION_TYPES.filter(t => t !== 'NONE').map(t => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: '#78716c', cursor: 'pointer', marginLeft: 'auto' }}>
+                <input type="checkbox" checked={showNone} onChange={e => setShowNone(e.target.checked)} />
+                show NONE
+              </label>
+            </div>
+
+            {/* legend */}
+            <div style={{ padding: '6px 12px', borderBottom: '1px solid #e7e5e4', display: 'flex', gap: 8, flexWrap: 'wrap', flexShrink: 0 }}>
+              {ACTION_TYPES.filter(t => t !== 'NONE').map(t => (
+                <span key={t} style={{ fontSize: 9, color: ACTION_COLORS[t], display: 'flex', alignItems: 'center', gap: 3 }}>
+                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: ACTION_COLORS[t], display: 'inline-block' }} />
+                  {t.replace('_',' ')}
+                </span>
+              ))}
+            </div>
+
+            {/* list */}
+            <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: 10, display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {actionList.map(({ key, idx, action }) => {
+                const isCurrent  = key === currentFrameKey;
+                const isSelected = key === selectedKey;
+                const color      = ACTION_COLORS[action.action] || '#d6d3d1';
+                const frameIdx   = frameKeys.indexOf(key);
+                const t          = frameToTime(key);
+
+                return (
+                  <div
+                    key={`${key}-${idx}`}
+                    data-key={key}
+                    onClick={() => seekToFrame(key)}
+                    style={{
+                      padding: '8px 10px',
+                      borderRadius: 7,
+                      border: `1px solid ${isCurrent ? color + '80' : isSelected ? '#c4b5a5' : '#e7e5e4'}`,
+                      background: isCurrent ? color + '10' : 'white',
+                      cursor: 'pointer',
+                      transition: 'border-color 0.1s, background 0.1s',
+                    }}
+                  >
+                    {/* row 1: dot + frame # + type selector */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
+                      <span style={{ width: 9, height: 9, borderRadius: '50%', background: color, flexShrink: 0 }} />
+                      <span style={{ fontSize: 10, color: '#a8a29e', fontFamily: 'monospace', flexShrink: 0 }}>
+                        f{String(frameIdx).padStart(4,' ')} &nbsp;{fmt(t)}
+                      </span>
+                      <select
+                        value={action.action}
+                        onClick={e => e.stopPropagation()}
+                        onChange={e => { e.stopPropagation(); changeActionType(key, idx, e.target.value); }}
+                        style={{ fontSize: 11, fontWeight: 600, border: 'none', background: 'transparent', cursor: 'pointer', color: color, flex: 1, minWidth: 0 }}
+                      >
+                        {ACTION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                      </select>
+                    </div>
+
+                    {/* row 2: metadata */}
+                    {action.action !== 'NONE' && (
+                      <div style={{ fontSize: 10, color: '#78716c', paddingLeft: 15, fontFamily: 'monospace', marginBottom: 5 }}>
+                        {action.x  != null && <span>({action.x}, {action.y}) &nbsp;</span>}
+                        {action.key != null && <span>key: "{action.key}" &nbsp;</span>}
+                        {action.dx  != null && <span>scroll Δ({action.dx},{action.dy})</span>}
+                      </div>
+                    )}
+
+                    {/* row 3: nudge / move / delete */}
+                    <div style={{ display: 'flex', gap: 4, paddingLeft: 15 }} onClick={e => e.stopPropagation()}>
+                      <button onClick={() => nudgeAction(key, idx, -1)} title="1 frame earlier"
+                        style={btnStyle}>-1f</button>
+                      <button onClick={() => nudgeAction(key, idx, +1)} title="1 frame later"
+                        style={btnStyle}>+1f</button>
+                      <button onClick={() => nudgeAction(key, idx, -5)} title="5 frames earlier"
+                        style={btnStyle}>-5f</button>
+                      <button onClick={() => nudgeAction(key, idx, +5)} title="5 frames later"
+                        style={btnStyle}>+5f</button>
+                      <button
+                        onClick={() => moveToCurrentFrame(key, idx)}
+                        title={`Move to current frame (f${currentFrameKey ? frameKeys.indexOf(currentFrameKey) : '?'})`}
+                        style={{ ...btnStyle, background: '#fef3c7', color: '#92400e', borderColor: '#fde68a' }}
+                      >→ here</button>
+                      <button onClick={() => deleteAction(key, idx)} title="Delete action"
+                        style={{ ...btnStyle, background: '#fff1f2', color: '#e11d48', borderColor: '#fecdd3', marginLeft: 'auto' }}>✕</button>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {actionList.length === 0 && (
+                <div style={{ textAlign: 'center', color: '#a8a29e', fontSize: 12, padding: 48 }}>
+                  No actions match the current filter
+                </div>
+              )}
+            </div>
+
+            {/* footer status */}
+            <div style={{ padding: '6px 12px', borderTop: '1px solid #e7e5e4', background: '#f5f5f4', display: 'flex', gap: 12, flexShrink: 0 }}>
+              {ACTION_TYPES.filter(t=>t!=='NONE').map(t => {
+                const count = Object.values(actions).flat().filter(a=>a.action===t).length;
+                return count > 0 ? (
+                  <span key={t} style={{ fontSize: 10, color: ACTION_COLORS[t] }}>
+                    {t.replace('LEFT_','L').replace('RIGHT_','R').replace('_','')} ×{count}
+                  </span>
+                ) : null;
+              })}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    const btnStyle = {
+      padding: '2px 7px', fontSize: 10,
+      border: '1px solid #e7e5e4', borderRadius: 3,
+      background: 'white', cursor: 'pointer', color: '#57534e',
+    };
+
+    // ─── App ─────────────────────────────────────────────────────────────────
+    function App() {
+      const [data, setData] = useState({ videoUrl: null, videoName: null, actions: null, jsonName: null, ready: false });
+      if (!data.ready || !data.videoUrl || !data.actions) return <UploadScreen data={data} onLoad={setData} />;
+      return <Editor {...data} onReset={() => setData({ videoUrl: null, videoName: null, actions: null, jsonName: null, ready: false })} />;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
