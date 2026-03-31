@@ -477,9 +477,10 @@
                       </span>
                       <select
                         value={action.action}
+                        onMouseDown={e => e.stopPropagation()}
                         onClick={e => e.stopPropagation()}
                         onChange={e => { e.stopPropagation(); changeActionType(key, idx, e.target.value); }}
-                        style={{ fontSize: 11, fontWeight: 600, border: 'none', background: 'transparent', cursor: 'pointer', color: color, flex: 1, minWidth: 0 }}
+                        style={{ fontSize: 10, fontWeight: 600, border: '1px solid #e7e5e4', borderRadius: 4, padding: '2px 4px', background: 'white', cursor: 'pointer', color: color, width: 'auto' }}
                       >
                         {ACTION_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
                       </select>
