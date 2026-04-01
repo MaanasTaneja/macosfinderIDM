@@ -5,6 +5,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from collections import deque
 from tqdm import tqdm
+from pathlib import Path
+import json 
 
 # need to reach into data-collection folder for the dataset
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'data-collection'))
@@ -13,12 +15,59 @@ from actiondataset import ActionDataset
 from idm import IDM_FCN, _get_clip_model
 from datacollector import Action
 
+def compute_action_classes_weight(action_enum : Action, action_json_paths : list):
+    #now we need to hard code the actions? probably ? np 
+    classes = [a.name for a in action_enum]
+    #create dict
+    classes_dict = {}
+    for c in classes:
+        classes_dict[c] = 0 #set count to zero.
+
+    #read through all files
+
+    total_num_actions = 0
+
+    for path in action_json_paths:
+        with open(path, 'r') as f:
+            action_json = json.load(f)
+            action_list = list(action_json.values())
+
+            #now we can calcuate.
+            for action in action_list:
+                #i thik. this is a bloody o(n3) operation since each frame can hgave multiple actions.
+                for ac in action:
+                    ac_name = ac["action"]  # each entry is a list of dicts, grab first action string.
+                    if ac_name not in classes_dict.keys():
+                        print(f"Invalid action json! {path}")
+                        continue
+                    classes_dict[ac_name] += 1
+                    total_num_actions += 1
+
+    #final weight calcuation — weight = 1 / frequency, then normalize so weights sum to num_classes.
+    #ordered by enum value so index 0 = NONE weight, index 1 = LEFT_CLICK weight etc matches CrossEntropyLoss.
+
+    weights = torch.tensor(
+        [1.0 / (classes_dict[a.name] / total_num_actions) if classes_dict[a.name] > 0 else 0.0 for a in action_enum],
+        dtype=torch.float32
+    )
+    weights = weights / weights.sum() * len(action_enum)  # normalize so scale stays similar to unweighted loss.
+    return weights
+        
+
+            
+
+    
+
+    
+
+
+
 
 def _train_step(model, optimizer, criterion, frames_before, frames_after, action):
     '''
     single gradient update step. broken out so the train loop stays readable.
     '''
-    optimizer.zero_grad()
+    optimizer.zero_grad() #zero gradient flusg the optimizer.
     logits = model(frames_before, frames_after)           # (1, num_classes)
     loss = criterion(logits, action.unsqueeze(0))
     loss.backward()
@@ -28,7 +77,7 @@ def _train_step(model, optimizer, criterion, frames_before, frames_after, action
     return loss.item(), int(predicted == action.item())
 
 
-def train(model, session_paths, epochs, lr=1e-3, save_dir="checkpoints"):
+def train(model, session_paths, epochs, action_class_weights, lr=1e-3, save_dir="checkpoints"):
     '''
     train the IDM. takes a model, list of session paths, trains for given epochs.
     saves a checkpoint after every epoch so we dont lose progress.
@@ -56,7 +105,10 @@ def train(model, session_paths, epochs, lr=1e-3, save_dir="checkpoints"):
     )
 
     # cross entropy handles log_softmax internally — model outputs raw logits, thats fine.
-    criterion = nn.CrossEntropyLoss()
+    #need to weight oour loss funciton, each clasificaiton task, NONE class shoudl have lower weight
+    #sinc eyou could do none to everything and still get like more than 60 percent of the time right.
+    #=
+    criterion = nn.CrossEntropyLoss(weight=action_class_weights.to(model.current_device))  # weight= not weights=, and must be on same device.
 
     model.train()
 
@@ -95,7 +147,7 @@ def train(model, session_paths, epochs, lr=1e-3, save_dir="checkpoints"):
 
             frames_before = list(frame_buffer)[:k]   # k frames before anchor
             frames_after  = list(frame_buffer)[k:]   # k frames after anchor
-            anchor_action = list(action_buffer)[k - 1]
+            anchor_action = list(action_buffer)[k - 1].to(model.current_device)  # move to same device as logits or cross entropy will crash.
 
             loss_val, is_correct = _train_step(
                 model, optimizer, criterion,
@@ -106,13 +158,22 @@ def train(model, session_paths, epochs, lr=1e-3, save_dir="checkpoints"):
             correct += is_correct
             total += 1
 
+            # print a mid-epoch update every 100 steps so we can see if loss is trending down
+            # without it spamming every single frame.
+            if total % 100 == 0:
+                running_avg = total_loss / total
+                print(f"  [step {total}] loss: {loss_val:.4f} | running avg: {running_avg:.4f}")
+
             # slide the window forward by one frame.
             frame_buffer.popleft()
             action_buffer.popleft()
 
         avg_loss = total_loss / max(total, 1)
         accuracy = correct / max(total, 1) * 100
-        print(f"epoch {epoch+1} — loss: {avg_loss:.4f} | accuracy: {accuracy:.1f}%")
+        # epoch summary is more prominent so its easy to distinguish from the step prints.
+        print(f"\n{'='*50}")
+        print(f"EPOCH {epoch+1}/{epochs} — avg loss: {avg_loss:.4f} | accuracy: {accuracy:.1f}%")
+        print(f"{'='*50}\n")
 
         # save checkpoint — window_size goes in too so inference can reconstruct the model.
         checkpoint_path = os.path.join(save_dir, f"epoch_{epoch+1}.pt")
@@ -138,8 +199,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # load session paths from the txt file — one path per line, skip blank lines.
+    action_class_jsons = [] 
     with open(args.sessions, 'r') as f:
         session_paths = [line.strip() for line in f if line.strip()]
+
+    for path in session_paths:
+        path_object = Path(path)
+        action_name = f"{path_object.name}.json"
+        action_path = path_object / action_name
+        action_class_jsons.append(action_path)
 
     print(f"loaded {len(session_paths)} sessions from {args.sessions}")
 
@@ -154,4 +222,5 @@ if __name__ == "__main__":
         num_action_classes=NUM_CLASSES
     )
 
-    train(model, session_paths, epochs=args.epochs, lr=args.lr, save_dir=args.save_dir)
+    action_class_weights = compute_action_classes_weight(Action, action_class_jsons)
+    train(model, session_paths, epochs=args.epochs, action_class_weights=action_class_weights, lr=args.lr, save_dir=args.save_dir)

@@ -107,14 +107,18 @@ class IDM_FCN(nn.Module):  # renamed from IDM_FCN_Multiple
             nn.Linear(in_features=input_dim, out_features=512),
             nn.ReLU(),
             nn.Linear(512, num_action_classes)
-        )
+        ).to(self.current_device)  # move fcn to same device as clip, otherwise weights will be on cpu and inputs on mps/cuda.
 
     def forward(self, frames_t, frames_t_1):
         frames_list = list(frames_t) + list(frames_t_1)  # safe list concat regardless of input type
         inputs = self.pretrained_clip_processor(images=frames_list, return_tensors='pt').to(self.current_device)
 
         with torch.no_grad():
-            image_embeddings = self.pretrained_clip_model.get_image_features(**inputs)
+            # call vision model directly and grab pooler_output — more explicit than get_image_features
+            # which returns different types depending on transformers version. then project into
+            # clip embedding space the same way get_image_features does internally.
+            vision_outputs  = self.pretrained_clip_model.vision_model(pixel_values=inputs['pixel_values'], return_dict=True)
+            image_embeddings = self.pretrained_clip_model.visual_projection(vision_outputs.pooler_output)
 
         # flatten all frame embeddings into one vector: (num_frames * embed_dim,)
         fcn_input = image_embeddings.view(1, -1)
