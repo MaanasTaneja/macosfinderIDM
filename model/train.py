@@ -54,15 +54,7 @@ def compute_action_classes_weight(action_enum : Action, action_json_paths : list
     return weights
         
 
-            
-
-    
-
-    
-
-
-
-
+        
 def _train_step(model, optimizer, criterion, frames_before, frames_after, action):
     '''
     single gradient update step. broken out so the train loop stays readable.
