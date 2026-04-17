@@ -106,7 +106,11 @@ class IDM_FCN(nn.Module):  # renamed from IDM_FCN_Multiple
         self.fcn = nn.Sequential(
             nn.Linear(in_features=input_dim, out_features=512),
             nn.ReLU(),
-            nn.Linear(512, num_action_classes)
+            nn.Dropout(0.3),
+            nn.Linear(in_features=512, out_features=256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, num_action_classes)
         ).to(self.current_device)  # move fcn to same device as clip, otherwise weights will be on cpu and inputs on mps/cuda.
 
     def forward(self, frames_t, frames_t_1):
@@ -124,6 +128,107 @@ class IDM_FCN(nn.Module):  # renamed from IDM_FCN_Multiple
         fcn_input = image_embeddings.view(1, -1)
 
         return self.fcn(fcn_input) #now output would be num actiona classes.
+
+
+class IDM_Transformer(nn.Module):
+    def __init__(self, clip_cache, window_size_t, embedding_dimension : int , num_action_classes : int):
+        super().__init__()
+
+        self.pretrained_clip_model = clip_cache[2] 
+        self.pretrained_clip_processor = clip_cache[1] #just preprocessor iage into tensor that s i .
+        self.current_device = clip_cache[0]
+
+        self.window_size_t = window_size_t
+        self.hidden_dim = embedding_dimension
+        self.num_action_classes = num_action_classes
+
+        for parameter in self.pretrained_clip_model.parameters():
+            parameter.requires_grad = False
+
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, self.window_size_t, self.hidden_dim)
+            ).to(self.current_device)
+        
+        #we dont need any input dimensions, since a transfomer expetcs a matrix X of (BATCHSIZE, WINDOW SIZE, EMBEDDING SIZE)
+        #so all i need to do in forward is go ove rframe batch take each frame out encode it using clip, and assemble the entire 
+        #matrix and send it direct to the stupid trasnfomer encoder. (no decoder since no need for masking, we need to do unmaked traiing seq2seq operation
+        #not an autoregresive opration like lanaguge egenration)
+
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead= 8, #8 attention heads.
+            dim_feedforward= 4 * self.hidden_dim,
+            batch_first=True
+        ).to(self.current_device)
+
+        self.transformer = nn.TransformerEncoder(
+            self.encoder_layer,
+            num_layers = 2
+        ).to(self.current_device)
+
+        #this is standard mlp, need to apply mlp for each window. pytorch will do it automatically?
+        #yes pytroch needs to run on each h latent embeddings (each trasnfomed frame embedding) will need to be 
+        #used to cacluate action (caslificaiton task) instead of foing a concat and then push, we are 
+        #trasnfome and then classify each frame.
+
+        #its actuall better to use a pairwie head.. (ht, ht+1 and then diff bw ht+1 and ht) the diff is our action signal
+        #what changed between these two frames.
+        #so then input dims are 512 + 512 + 512 (three embeddings)
+        #so final shape of matrix that will go into head is b, t-1, 1536
+        self.action_head = nn.Sequential(
+            nn.Linear(1536, 512),
+            nn.ReLU(),
+            nn.Linear(512, self.num_action_classes),
+        ).to(self.current_device)  # must be on same device as transformer output.
+
+        self.action_head_no_pair = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, self.num_action_classes),
+        ).to(self.current_device)  # must be on same device as transformer output.
+
+    @property
+    def device(self):
+        # alias so train_transformer.py can use model.device consistently.
+        return self.current_device
+
+    def forward(self, frame_batch):
+        '''
+        frames_batch:  list of B windows, each window is a list of T frames
+        frames batch is just a python list of b windows (batch size, 32) and t frames in each window.
+        '''
+
+        frames_batch_embedded = []
+        for window_frames in frame_batch:
+            # window_frames is a list of T raw numpy (H,W,C) arrays — need to run through
+            # clip processor first to get pixel_values tensor before vision model can use them.
+            inputs = self.pretrained_clip_processor(images=window_frames, return_tensors='pt').to(self.current_device)
+            with torch.no_grad():
+                vision_outputs   = self.pretrained_clip_model.vision_model(pixel_values=inputs['pixel_values'], return_dict=True)
+                image_embeddings = self.pretrained_clip_model.visual_projection(vision_outputs.pooler_output)
+                # output is (T, 512) — one embedding per frame in this window.
+            frames_batch_embedded.append(image_embeddings)
+
+        x = torch.stack(frames_batch_embedded, dim=0).to(self.current_device)
+        x = x + self.pos_embedding[:, :x.size(1), :] #append positonal embedding
+        #final shape should be batch, window, embedding space.
+
+        #now direct push this into trasnfomer,.
+        latent_space_output = self.transformer(x)
+
+        #generate pair wise embeddings
+        pair_repr = torch.cat([ #and concat everything exapnd basically.
+            latent_space_output[:, :-1, :],              # all tensors expect last one 
+            latent_space_output[:, 1:, :],               # all tensors after first shifted
+            latent_space_output[:, 1:, :] - latent_space_output[:, :-1, :] # difference
+        ], dim=-1)
+
+        #logits = self.action_head(pair_repr)
+
+        logits = self.action_head_no_pair(latent_space_output)
+        return logits[:, :-1]
+
+        #return logits
 
 
 

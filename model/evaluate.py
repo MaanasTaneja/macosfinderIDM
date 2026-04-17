@@ -8,7 +8,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'data-collection')
 
 from datacollector import Action
 
-
 def evaluate_session(session_path):
     '''
     compare ground truth json vs predicted json for a single session.

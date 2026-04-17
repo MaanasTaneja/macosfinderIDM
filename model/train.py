@@ -1,12 +1,13 @@
 import os
 import sys
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from collections import deque
 from tqdm import tqdm
 from pathlib import Path
-import json 
+import json
 
 # need to reach into data-collection folder for the dataset
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'data-collection'))
@@ -14,6 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'data-collection')
 from actiondataset import ActionDataset
 from idm import IDM_FCN, _get_clip_model
 from datacollector import Action
+
 
 def compute_action_classes_weight(action_enum : Action, action_json_paths : list):
     #now we need to hard code the actions? probably ? np 
@@ -55,6 +57,42 @@ def compute_action_classes_weight(action_enum : Action, action_json_paths : list
         
 
         
+def compute_none_keep_prob(action_json_paths : list, multiplier : float = 3.0):
+    '''
+    dynamically compute how many NONE frames to keep during training.
+    strategy: find the median non-NONE class count, set target NONE = median * multiplier.
+    this keeps NONE more common than other classes (reflecting reality) but not so dominant
+    it drowns everything out. multiplier is your one tuning knob.
+
+    returns (none_keep_prob, counts_dict) — prob so train loop can use it,
+    counts dict so we can print the expected distribution and inspect it.
+    '''
+
+    # count all actions across all session jsons.
+    counts = {}
+    for path in action_json_paths:
+        with open(path, 'r') as f:
+            action_json = json.load(f)
+        for entry in action_json.values():
+            ac_name = entry[0]["action"]
+            counts[ac_name] = counts.get(ac_name, 0) + 1
+
+    none_count = counts.get("NONE", 0)
+
+    # median of non-NONE class counts — robust to outliers like SCROLL having 7 examples.
+    non_none_counts = sorted([v for k, v in counts.items() if k != "NONE"])
+    if not non_none_counts:
+        return 1.0, counts  # nothing to balance against, keep everything.
+
+    median_non_none = non_none_counts[len(non_none_counts) // 2]
+
+    # target none count = median * multiplier, then compute keep prob.
+    target_none = median_non_none * multiplier
+    none_keep_prob = min(target_none / none_count, 1.0)  # cap at 1.0 so we never upsample.
+
+    return none_keep_prob, counts
+
+
 def _train_step(model, optimizer, criterion, frames_before, frames_after, action):
     '''
     single gradient update step. broken out so the train loop stays readable.
@@ -69,7 +107,7 @@ def _train_step(model, optimizer, criterion, frames_before, frames_after, action
     return loss.item(), int(predicted == action.item())
 
 
-def train(model, session_paths, epochs, action_class_weights, lr=1e-3, save_dir="checkpoints"):
+def train(model, session_paths, epochs, action_class_weights, lr=1e-3, save_dir="checkpoints", none_keep_prob=0.2):
     '''
     train the IDM. takes a model, list of session paths, trains for given epochs.
     saves a checkpoint after every epoch so we dont lose progress.
@@ -119,6 +157,7 @@ def train(model, session_paths, epochs, action_class_weights, lr=1e-3, save_dir=
 
         for (f1, f2), action in tqdm(loader, desc=f"epoch {epoch+1}/{epochs}"):
             # DataLoader wraps everything in a batch dim — squeeze it out.
+
             f1 = f1.squeeze(0).numpy()
             f2 = f2.squeeze(0).numpy()
             action = action.squeeze(0)
@@ -140,6 +179,16 @@ def train(model, session_paths, epochs, action_class_weights, lr=1e-3, save_dir=
             frames_before = list(frame_buffer)[:k]   # k frames before anchor
             frames_after  = list(frame_buffer)[k:]   # k frames after anchor
             anchor_action = list(action_buffer)[k - 1].to(model.current_device)  # move to same device as logits or cross entropy will crash.
+
+
+            # undersample NONE frames — keeping only none_keep_prob fraction of them.
+            # since we are using this as a labeller not a live predictor, we want the model
+            # to be aggressive about predicting non-NONE actions, not just defaulting to NONE.
+            if anchor_action.item() == Action.NONE.value:
+                if random.random() > none_keep_prob:
+                    frame_buffer.popleft()
+                    action_buffer.popleft()
+                    continue
 
             loss_val, is_correct = _train_step(
                 model, optimizer, criterion,
@@ -187,7 +236,9 @@ if __name__ == "__main__":
     parser.add_argument("--window_size",  type=int,   default=1,         help="k frames on each side of anchor")
     parser.add_argument("--epochs",       type=int,   default=10)
     parser.add_argument("--lr",           type=float, default=1e-3)
-    parser.add_argument("--save_dir",     default="checkpoints",  help="where to save checkpoints")
+    parser.add_argument("--save_dir",       default="checkpoints",  help="where to save checkpoints")
+    parser.add_argument("--none_keep_prob", type=float, default=None,  help="manually override none keep prob — if not set, computed dynamically from data")
+    parser.add_argument("--none_multiplier", type=float, default=3.0,  help="target NONE = median_non_none * multiplier (used for dynamic none_keep_prob)")
     args = parser.parse_args()
 
     # load session paths from the txt file — one path per line, skip blank lines.
@@ -215,4 +266,18 @@ if __name__ == "__main__":
     )
 
     action_class_weights = compute_action_classes_weight(Action, action_class_jsons)
-    train(model, session_paths, epochs=args.epochs, action_class_weights=action_class_weights, lr=args.lr, save_dir=args.save_dir)
+
+    # compute none_keep_prob dynamically unless user explicitly overrides it.
+    if args.none_keep_prob is not None:
+        none_keep_prob = args.none_keep_prob
+        print(f"using manual none_keep_prob: {none_keep_prob:.3f}")
+    else:
+        none_keep_prob, counts = compute_none_keep_prob(action_class_jsons, multiplier=args.none_multiplier)
+        print(f"\ndynamic none_keep_prob = {none_keep_prob:.3f} (multiplier={args.none_multiplier})")
+        print("raw counts:")
+        for k, v in sorted(counts.items(), key=lambda x: -x[1]):
+            effective = int(v * none_keep_prob) if k == "NONE" else v
+            print(f"  {k:<20} raw: {v:>5}   effective (after sampling): {effective:>5}")
+        print()
+
+    train(model, session_paths, epochs=args.epochs, action_class_weights=action_class_weights, lr=args.lr, save_dir=args.save_dir, none_keep_prob=none_keep_prob)
